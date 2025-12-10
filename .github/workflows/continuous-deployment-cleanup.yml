@@ -1,0 +1,73 @@
+name: Cleanup pull request previews
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  cleanup-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v6
+        with:
+          ref: staging
+          fetch-depth: 0
+      - name: Find and remove preview directories
+        id: cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          REMOVED_PREVIEWS=""
+          # Find all _staging directories that match this PR
+          if [ -d "_staging" ]; then
+            for dir in _staging/*/; do
+              if [ -f "${dir}preview-meta.json" ]; then
+                PR_NUM=$(jq -r '.pr_number' "${dir}preview-meta.json")
+                if [ "$PR_NUM" = "${{ github.event.pull_request.number }}" ]; then
+                  PREVIEW_DIR=$(basename "$dir")
+                  rm -rf "$dir"
+                  REMOVED_PREVIEWS="${REMOVED_PREVIEWS}_staging/${PREVIEW_DIR} "
+                  echo "🗑️ Removed _staging/${PREVIEW_DIR}"
+                fi
+              fi
+            done
+          fi
+          if [ -n "$REMOVED_PREVIEWS" ]; then
+            git add _staging
+            git commit -m "Remove previews for closed PR #${{ github.event.pull_request.number }}" || echo "No changes to commit"
+            git push origin staging
+            echo "removed=true" >> $GITHUB_OUTPUT
+            echo "previews=${REMOVED_PREVIEWS}" >> $GITHUB_OUTPUT
+          else
+            echo "removed=false" >> $GITHUB_OUTPUT
+            echo "No previews found for PR #${{ github.event.pull_request.number }}"
+          fi
+      - name: Trigger aggregation workflow
+        if: steps.cleanup.outputs.removed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'continuous-deployment-aggregate.yml',
+              ref: 'main'
+            });
+      - name: Comment on PR
+        if: steps.cleanup.outputs.removed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = `## 🧹 Preview Cleaned Up\n\nPreview site(s) have been removed from GitHub Pages.\n\n*The site will be updated within ~2 minutes.*`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });

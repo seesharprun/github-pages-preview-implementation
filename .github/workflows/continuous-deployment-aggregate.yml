@@ -1,0 +1,74 @@
+name: Deploy live site with aggregated previews
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: "pages-deploy"
+  cancel-in-progress: false
+jobs:
+  aggregate-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Checkout staging branch for previews
+        run: |
+          git fetch origin staging:staging 2>/dev/null || echo "No staging branch yet"
+      - name: Build aggregated site
+        run: |
+          mkdir -p _site
+          # Copy main branch content (excluding _staging, git, github)
+          rsync -av --exclude='_staging' --exclude='_site' --exclude='.git' --exclude='.github' . _site/
+          # Add all staging previews from staging branch
+          if git rev-parse --verify staging >/dev/null 2>&1; then
+            git checkout staging -- _staging 2>/dev/null || echo "No _staging directory in staging branch"
+            if [ -d "_staging" ]; then
+              cp -r _staging _site/
+              echo "✅ Copied staging previews"
+              ls -la _site/_staging/ || echo "No previews found"
+            fi
+          fi
+      - name: Checkout live branch
+        run: |
+          git fetch origin live:live 2>/dev/null || git checkout --orphan live
+          git checkout live || echo "Creating new live branch"
+      - name: Commit aggregated site to live branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Remove old content
+          git rm -rf . 2>/dev/null || true
+          # Copy new site content
+          cp -r _site/* .
+          # Commit and push
+          git add .
+          git commit -m "Deploy site - $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "No changes to commit"
+          git push origin live
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "_site"
+  deploy:
+    name: Deploy to GitHub Pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: aggregate-and-build
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,131 @@
+name: Compile pull request previews
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+concurrency:
+  group: pages-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  build-and-commit-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Set staging directory
+        id: staging
+        run: |
+          SHORT_SHA=$(echo ${{ github.event.pull_request.head.sha }} | cut -c1-7)
+          STAGING_DIR="_staging/${SHORT_SHA}"
+          echo "staging_dir=${STAGING_DIR}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          echo "preview_url=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${STAGING_DIR}/" >> $GITHUB_OUTPUT
+      - name: Build preview content
+        run: |
+          mkdir -p preview_build/${{ steps.staging.outputs.staging_dir }}
+          cp index.html theme.js preview_build/${{ steps.staging.outputs.staging_dir }}/
+      - name: Checkout staging branch
+        run: |
+          git fetch origin staging:staging || git checkout --orphan staging
+          git checkout staging || echo "Creating new branch"
+      - name: Commit preview to staging branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Copy the preview files
+          mkdir -p ${{ steps.staging.outputs.staging_dir }}
+          cp -r preview_build/${{ steps.staging.outputs.staging_dir }}/* ${{ steps.staging.outputs.staging_dir }}/
+          # Create metadata file
+          cat > ${{ steps.staging.outputs.staging_dir }}/preview-meta.json << EOF
+          {
+            "pr_number": ${{ github.event.pull_request.number }},
+            "commit_sha": "${{ github.event.pull_request.head.sha }}",
+            "short_sha": "${{ steps.staging.outputs.short_sha }}",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          git add ${{ steps.staging.outputs.staging_dir }}
+          git commit -m "Add preview for PR #${{ github.event.pull_request.number }} (${SHORT_SHA})" || echo "No changes to commit"
+          git push origin staging
+      - name: Trigger aggregation workflow and wait
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Trigger the workflow
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'continuous-deployment-aggregate.yml',
+              ref: 'main'
+            });
+            
+            // Wait for the workflow to start and complete
+            const maxAttempts = 60; // 5 minutes max
+            const delayMs = 5000; // Check every 5 seconds
+            
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              await new Promise(resolve => setTimeout(resolve, delayMs));
+              
+              // Get recent workflow runs
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'continuous-deployment-aggregate.yml',
+                per_page: 5
+              });
+              
+              // Find the most recent run triggered after this dispatch
+              const recentRun = runs.data.workflow_runs[0];
+              
+              if (recentRun && recentRun.status === 'completed') {
+                if (recentRun.conclusion === 'success') {
+                  console.log('Aggregation workflow completed successfully');
+                  return;
+                } else {
+                  throw new Error(`Aggregation workflow failed with conclusion: ${recentRun.conclusion}`);
+                }
+              }
+            }
+            
+            throw new Error('Timeout waiting for aggregation workflow to complete');
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const shortSha = '${{ steps.staging.outputs.short_sha }}';
+            const previewUrl = `https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/_staging/${shortSha}/`;
+            const body = `## ✅ Preview Ready!\n\n**Preview URL:** ${previewUrl}\n**Commit:** \`${shortSha}\`\n\n*Your preview is now live and ready to view.*`;
+            // Check for existing comments
+            const comments = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const botComment = comments.data.find(comment => 
+              comment.user.type === 'Bot' && comment.body.includes('🚀 Preview')
+            );
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            }
